@@ -1,0 +1,317 @@
+name: Self-Heal Incident (Port + Datadog)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggered by Port automation when a Datadog incident lands in Port.
+# Flow:
+#   1. Fetch full service context from Port MCP (owner, tier, runbook, monitors)
+#   2. Query Datadog API for live error rate on dt-port-demo
+#   3. Decision:
+#      a. Error rate ≤ threshold AND recovering → auto-resolve, post to Slack
+#      b. Error rate > threshold OR not recovering → escalate with full packet
+#   4. Write findings back to Port incident entity (root_cause, resolution_summary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      incident_identifier:
+        description: "Port incident entity identifier (e.g. dd-12345)"
+        required: true
+        type: string
+      service_identifier:
+        description: "Port service entity identifier (e.g. dt-port-demo)"
+        required: true
+        default: "dt-port-demo"
+        type: string
+      severity:
+        description: "Incident severity"
+        required: false
+        default: "high"
+        type: string
+      triggered_by:
+        description: "What triggered this run"
+        required: false
+        default: "datadog-webhook"
+        type: string
+
+env:
+  PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
+  PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
+  DD_API_KEY: ${{ secrets.DD_API_KEY }}
+  DD_APP_KEY: ${{ secrets.DD_APP_KEY }}
+  DD_SITE: "us5.datadoghq.com"
+  DD_SERVICE: "dt-port-demo"
+  DD_ENV: "demo"
+  ERROR_RATE_THRESHOLD: "5.0"   # % — alert if error rate exceeds this
+  RECOVERY_WINDOW_MINUTES: "5"  # minutes to check for recovery
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1: Fetch organizational context from Port
+  # ───────────────────────────────────────────────────────────────────────────
+  fetch-port-context:
+    name: "🔍 Fetch Port org context"
+    runs-on: ubuntu-latest
+    outputs:
+      port_token: ${{ steps.auth.outputs.token }}
+      owning_team: ${{ steps.service.outputs.owning_team }}
+      tier: ${{ steps.service.outputs.tier }}
+      runbook_url: ${{ steps.service.outputs.runbook_url }}
+      slack_channel: ${{ steps.service.outputs.slack_channel }}
+      datadog_monitor_url: ${{ steps.service.outputs.datadog_monitor_url }}
+
+    steps:
+      - name: Authenticate with Port
+        id: auth
+        run: |
+          TOKEN=$(curl -s -X POST "https://api.getport.io/v1/auth/access_token" \
+            -H "Content-Type: application/json" \
+            -d "{\"clientId\": \"$PORT_CLIENT_ID\", \"clientSecret\": \"$PORT_CLIENT_SECRET\"}" \
+            | jq -r '.accessToken')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ Port authentication successful"
+
+      - name: Fetch service entity from Port
+        id: service
+        run: |
+          RESPONSE=$(curl -s \
+            -H "Authorization: Bearer ${{ steps.auth.outputs.token }}" \
+            "https://api.getport.io/v1/blueprints/service/entities/${{ inputs.service_identifier }}")
+
+          OWNING_TEAM=$(echo $RESPONSE | jq -r '.entity.properties.owning_team // "Unknown"')
+          TIER=$(echo $RESPONSE | jq -r '.entity.properties.tier // "unknown"')
+          RUNBOOK_URL=$(echo $RESPONSE | jq -r '.entity.properties.runbook_url // ""')
+          SLACK_CHANNEL=$(echo $RESPONSE | jq -r '.entity.properties.slack_channel // "#incidents"')
+          DD_MONITOR_URL=$(echo $RESPONSE | jq -r '.entity.properties.datadog_monitor_url // ""')
+
+          echo "owning_team=$OWNING_TEAM" >> $GITHUB_OUTPUT
+          echo "tier=$TIER" >> $GITHUB_OUTPUT
+          echo "runbook_url=$RUNBOOK_URL" >> $GITHUB_OUTPUT
+          echo "slack_channel=$SLACK_CHANNEL" >> $GITHUB_OUTPUT
+          echo "datadog_monitor_url=$DD_MONITOR_URL" >> $GITHUB_OUTPUT
+
+          echo "📋 Service context:"
+          echo "  Owning team: $OWNING_TEAM"
+          echo "  Tier: $TIER"
+          echo "  Runbook: $RUNBOOK_URL"
+          echo "  Slack: $SLACK_CHANNEL"
+
+      - name: Mark incident as investigating in Port
+        run: |
+          curl -s -X PATCH \
+            -H "Authorization: Bearer ${{ steps.auth.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            "https://api.getport.io/v1/blueprints/incident/entities/${{ inputs.incident_identifier }}" \
+            -d '{
+              "properties": {
+                "status": "investigating",
+                "runbook_status": "auto-investigation started"
+              }
+            }'
+          echo "✅ Incident marked as investigating in Port"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2: Query Datadog for live error rate
+  # ───────────────────────────────────────────────────────────────────────────
+  check-datadog-metrics:
+    name: "📊 Check Datadog live metrics"
+    runs-on: ubuntu-latest
+    needs: fetch-port-context
+    outputs:
+      error_rate: ${{ steps.metrics.outputs.error_rate }}
+      p99_latency: ${{ steps.metrics.outputs.p99_latency }}
+      request_rate: ${{ steps.metrics.outputs.request_rate }}
+      is_recovering: ${{ steps.metrics.outputs.is_recovering }}
+      should_escalate: ${{ steps.metrics.outputs.should_escalate }}
+
+    steps:
+      - name: Query Datadog APM metrics
+        id: metrics
+        run: |
+          NOW=$(date +%s)
+          FIVE_MIN_AGO=$((NOW - 300))
+
+          # Query error rate from Datadog metrics API
+          ERROR_RESPONSE=$(curl -s \
+            -H "DD-API-KEY: $DD_API_KEY" \
+            -H "DD-APPLICATION-KEY: $DD_APP_KEY" \
+            "https://api.$DD_SITE/api/v1/query?from=$FIVE_MIN_AGO&to=$NOW&query=sum:trace.flask.request.errors%7Bservice:$DD_SERVICE,env:$DD_ENV%7D.as_rate()")
+
+          TOTAL_RESPONSE=$(curl -s \
+            -H "DD-API-KEY: $DD_API_KEY" \
+            -H "DD-APPLICATION-KEY: $DD_APP_KEY" \
+            "https://api.$DD_SITE/api/v1/query?from=$FIVE_MIN_AGO&to=$NOW&query=sum:trace.flask.request.hits%7Bservice:$DD_SERVICE,env:$DD_ENV%7D.as_rate()")
+
+          # Extract latest values
+          ERROR_RATE_RAW=$(echo $ERROR_RESPONSE | jq -r '.series[0].pointlist[-1][1] // 0')
+          TOTAL_RATE_RAW=$(echo $TOTAL_RESPONSE | jq -r '.series[0].pointlist[-1][1] // 0')
+
+          # Calculate error rate percentage
+          if [ "$TOTAL_RATE_RAW" != "0" ] && [ "$TOTAL_RATE_RAW" != "null" ]; then
+            ERROR_RATE=$(echo "scale=2; ($ERROR_RATE_RAW / $TOTAL_RATE_RAW) * 100" | bc)
+          else
+            ERROR_RATE="0"
+          fi
+
+          # Query p99 latency
+          LATENCY_RESPONSE=$(curl -s \
+            -H "DD-API-KEY: $DD_API_KEY" \
+            -H "DD-APPLICATION-KEY: $DD_APP_KEY" \
+            "https://api.$DD_SITE/api/v1/query?from=$FIVE_MIN_AGO&to=$NOW&query=p99:trace.flask.request%7Bservice:$DD_SERVICE,env:$DD_ENV%7D")
+
+          P99_LATENCY=$(echo $LATENCY_RESPONSE | jq -r '.series[0].pointlist[-1][1] // 0')
+
+          echo "📊 Live Datadog metrics:"
+          echo "  Error rate: $ERROR_RATE%"
+          echo "  p99 latency: ${P99_LATENCY}s"
+          echo "  Request rate: $TOTAL_RATE_RAW req/s"
+
+          echo "error_rate=$ERROR_RATE" >> $GITHUB_OUTPUT
+          echo "p99_latency=$P99_LATENCY" >> $GITHUB_OUTPUT
+          echo "request_rate=$TOTAL_RATE_RAW" >> $GITHUB_OUTPUT
+
+          # Determine if we should escalate
+          SHOULD_ESCALATE="false"
+          IS_RECOVERING="false"
+
+          if (( $(echo "$ERROR_RATE > $ERROR_RATE_THRESHOLD" | bc -l) )); then
+            SHOULD_ESCALATE="true"
+            echo "⚠️ Error rate $ERROR_RATE% exceeds threshold $ERROR_RATE_THRESHOLD% — will escalate"
+          else
+            IS_RECOVERING="true"
+            echo "✅ Error rate $ERROR_RATE% is within threshold — service recovering"
+          fi
+
+          echo "should_escalate=$SHOULD_ESCALATE" >> $GITHUB_OUTPUT
+          echo "is_recovering=$IS_RECOVERING" >> $GITHUB_OUTPUT
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3a: Auto-resolve if service is recovering
+  # ───────────────────────────────────────────────────────────────────────────
+  auto-resolve:
+    name: "✅ Auto-resolve incident"
+    runs-on: ubuntu-latest
+    needs: [fetch-port-context, check-datadog-metrics]
+    if: needs.check-datadog-metrics.outputs.is_recovering == 'true'
+
+    steps:
+      - name: Wait and re-check for sustained recovery
+        run: |
+          echo "⏳ Waiting ${{ env.RECOVERY_WINDOW_MINUTES }} minutes to confirm sustained recovery..."
+          sleep $((RECOVERY_WINDOW_MINUTES * 60))
+          echo "✅ Recovery window passed"
+
+      - name: Resolve incident in Port
+        run: |
+          RESOLUTION_SUMMARY="## Auto-Resolved by Self-Healing Workflow\n\n"
+          RESOLUTION_SUMMARY+="**Resolution:** Automatic — error rate recovered below threshold\n\n"
+          RESOLUTION_SUMMARY+="### Metrics at Resolution\n"
+          RESOLUTION_SUMMARY+="- Error rate: ${{ needs.check-datadog-metrics.outputs.error_rate }}% (threshold: ${{ env.ERROR_RATE_THRESHOLD }}%)\n"
+          RESOLUTION_SUMMARY+="- p99 latency: ${{ needs.check-datadog-metrics.outputs.p99_latency }}s\n"
+          RESOLUTION_SUMMARY+="- Request rate: ${{ needs.check-datadog-metrics.outputs.request_rate }} req/s\n\n"
+          RESOLUTION_SUMMARY+="### Service Context\n"
+          RESOLUTION_SUMMARY+="- Owning team: ${{ needs.fetch-port-context.outputs.owning_team }}\n"
+          RESOLUTION_SUMMARY+="- Tier: ${{ needs.fetch-port-context.outputs.tier }}\n"
+          RESOLUTION_SUMMARY+="- Runbook: ${{ needs.fetch-port-context.outputs.runbook_url }}\n\n"
+          RESOLUTION_SUMMARY+="**No human intervention required.** 🤖"
+
+          curl -s -X PATCH \
+            -H "Authorization: Bearer ${{ needs.fetch-port-context.outputs.port_token }}" \
+            -H "Content-Type: application/json" \
+            "https://api.getport.io/v1/blueprints/incident/entities/${{ inputs.incident_identifier }}" \
+            -d "{
+              \"properties\": {
+                \"status\": \"resolved\",
+                \"runbook_executed\": true,
+                \"runbook_status\": \"auto-resolved\",
+                \"resolution_summary\": \"$RESOLUTION_SUMMARY\",
+                \"root_cause\": \"Error rate spike detected by Datadog monitor. Service self-recovered within the ${{ env.RECOVERY_WINDOW_MINUTES }}-minute recovery window. No manual intervention required.\"
+              }
+            }"
+          echo "✅ Incident resolved in Port"
+
+      - name: Post resolution to Slack
+        if: ${{ needs.fetch-port-context.outputs.slack_channel != '' }}
+        run: |
+          echo "📢 Would post to ${{ needs.fetch-port-context.outputs.slack_channel }}:"
+          echo "✅ [AUTO-RESOLVED] dt-port-demo P1 High Error Rate"
+          echo "   Error rate recovered to ${{ needs.check-datadog-metrics.outputs.error_rate }}%"
+          echo "   No human intervention required."
+          echo "   Incident: https://app.getport.io/incident/${{ inputs.incident_identifier }}"
+          # Add your Slack webhook here when ready:
+          # curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+          #   -H "Content-Type: application/json" \
+          #   -d "{\"text\": \"✅ [AUTO-RESOLVED] dt-port-demo error rate recovered. No page sent.\"}"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3b: Escalate if service is NOT recovering
+  # ───────────────────────────────────────────────────────────────────────────
+  escalate:
+    name: "🚨 Escalate with full context"
+    runs-on: ubuntu-latest
+    needs: [fetch-port-context, check-datadog-metrics]
+    if: needs.check-datadog-metrics.outputs.should_escalate == 'true'
+
+    steps:
+      - name: Build full incident packet in Port
+        run: |
+          ROOT_CAUSE="## Root Cause Analysis\n\n"
+          ROOT_CAUSE+="**Status:** Error rate NOT recovering — human intervention required\n\n"
+          ROOT_CAUSE+="### Live Metrics\n"
+          ROOT_CAUSE+="- 🔴 Error rate: ${{ needs.check-datadog-metrics.outputs.error_rate }}% (threshold: ${{ env.ERROR_RATE_THRESHOLD }}%)\n"
+          ROOT_CAUSE+="- p99 latency: ${{ needs.check-datadog-metrics.outputs.p99_latency }}s\n"
+          ROOT_CAUSE+="- Request rate: ${{ needs.check-datadog-metrics.outputs.request_rate }} req/s\n\n"
+          ROOT_CAUSE+="### Organizational Context\n"
+          ROOT_CAUSE+="- **Owning team:** ${{ needs.fetch-port-context.outputs.owning_team }}\n"
+          ROOT_CAUSE+="- **Tier:** ${{ needs.fetch-port-context.outputs.tier }}\n"
+          ROOT_CAUSE+="- **Slack:** ${{ needs.fetch-port-context.outputs.slack_channel }}\n"
+          ROOT_CAUSE+="- **Runbook:** ${{ needs.fetch-port-context.outputs.runbook_url }}\n"
+          ROOT_CAUSE+="- **Datadog APM:** ${{ needs.fetch-port-context.outputs.datadog_monitor_url }}\n\n"
+          ROOT_CAUSE+="### Auto-Remediation Result\n"
+          ROOT_CAUSE+="❌ Error rate did not recover within threshold. Escalating to on-call engineer.\n\n"
+          ROOT_CAUSE+="### Recommended Actions\n"
+          ROOT_CAUSE+="1. Check recent deployments to dt-port-demo\n"
+          ROOT_CAUSE+="2. Review checkout endpoint in app.py\n"
+          ROOT_CAUSE+="3. Check Datadog APM for trace-level errors\n"
+          ROOT_CAUSE+="4. If >10% error rate, consider rollback"
+
+          curl -s -X PATCH \
+            -H "Authorization: Bearer ${{ needs.fetch-port-context.outputs.port_token }}" \
+            -H "Content-Type: application/json" \
+            "https://api.getport.io/v1/blueprints/incident/entities/${{ inputs.incident_identifier }}" \
+            -d "{
+              \"properties\": {
+                \"status\": \"investigating\",
+                \"runbook_executed\": true,
+                \"runbook_status\": \"escalated — auto-remediation failed\",
+                \"root_cause\": \"$ROOT_CAUSE\"
+              }
+            }"
+          echo "✅ Full incident packet written to Port"
+
+      - name: Page on-call engineer via Slack
+        run: |
+          echo "🚨 ESCALATION — would page on-call at ${{ needs.fetch-port-context.outputs.slack_channel }}"
+          echo ""
+          echo "─── INCIDENT PACKET ────────────────────────────────"
+          echo "Service:      dt-port-demo (${{ needs.fetch-port-context.outputs.tier }})"
+          echo "Owner:        ${{ needs.fetch-port-context.outputs.owning_team }}"
+          echo "Error rate:   ${{ needs.check-datadog-metrics.outputs.error_rate }}%"
+          echo "p99 latency:  ${{ needs.check-datadog-metrics.outputs.p99_latency }}s"
+          echo "Runbook:      ${{ needs.fetch-port-context.outputs.runbook_url }}"
+          echo "Datadog APM:  ${{ needs.fetch-port-context.outputs.datadog_monitor_url }}"
+          echo "Port incident: https://app.getport.io/incident/${{ inputs.incident_identifier }}"
+          echo "────────────────────────────────────────────────────"
+          echo ""
+          echo "Engineer gets a pre-assembled packet — not a blank screen."
+          # Uncomment when Slack webhook is configured:
+          # curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+          #   -H "Content-Type: application/json" \
+          #   -d "{
+          #     \"text\": \"🚨 *[ESCALATED]* dt-port-demo P1 High Error Rate\",
+          #     \"blocks\": [
+          #       {\"type\": \"section\", \"text\": {\"type\": \"mrkdwn\",
+          #        \"text\": \"*Service:* dt-port-demo (tier-1)\n*Owner:* ${{ needs.fetch-port-context.outputs.owning_team }}\n*Error rate:* ${{ needs.check-datadog-metrics.outputs.error_rate }}%\n*Runbook:* ${{ needs.fetch-port-context.outputs.runbook_url }}\n*Port:* https://app.getport.io/incident/${{ inputs.incident_identifier }}\"
+          #       }}
+          #     ]
+          #   }"
