@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Products · shopdemo{% endblock %}
+{% block content %}
+  <h1>Products</h1>
+  <p style="color:var(--muted)">Click "Add to cart" to put items in your cart. Then go to the cart and try checkout — about 1 in 20 checkouts will deliberately fail (simulated payment gateway error), which makes the Dynatrace failure-rate chart actually interesting.</p>
+  <div class="grid">
+    {% for p in products %}
+      <div class="card">
+        <div class="cat">{{ p.category }}</div>
+        <h3>{{ p.name }}</h3>
+        <div class="price">${{ "%.2f"|format(p.price) }}</div>
+        <div class="stock">{{ p.stock }} in stock · {{ p.sku }}</div>
+        <form method="post" action="{{ url_for('cart_add') }}" style="margin-top:.75rem">
+          <input type="hidden" name="sku" value="{{ p.sku }}">
+          <input type="hidden" name="qty" value="1">
+          <button class="btn" type="submit">Add to cart</button>
+        </form>
+      </div>
+    {% endfor %}
+  </div>
+{% endblock %}

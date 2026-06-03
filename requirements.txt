@@ -1,0 +1,10 @@
+flask==3.0.3
+requests==2.32.3
+setuptools<81
+opentelemetry-distro==0.48b0
+opentelemetry-exporter-otlp==1.27.0
+opentelemetry-instrumentation-flask==0.48b0
+opentelemetry-instrumentation-requests==0.48b0
+opentelemetry-instrumentation-logging==0.48b0
+ddtrace>=2.0.0
+python-dotenv>=1.0.0

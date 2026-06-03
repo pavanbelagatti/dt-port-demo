@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}{{ order.id }} · shopdemo{% endblock %}
+{% block content %}
+  <h1>Order {{ order.id }} <span class="status-badge confirmed" style="vertical-align:middle">{{ order.status }}</span></h1>
+  <table>
+    <thead><tr><th>Product</th><th>SKU</th><th>Qty</th><th>Line total</th></tr></thead>
+    <tbody>
+      {% for l in order.lines %}
+        <tr>
+          <td>{{ l.name }}</td>
+          <td style="color:var(--muted)">{{ l.sku }}</td>
+          <td>{{ l.qty }}</td>
+          <td>${{ "%.2f"|format(l.line_total) }}</td>
+        </tr>
+      {% endfor %}
+      <tr class="total-row"><td colspan="3">Total</td><td>${{ "%.2f"|format(order.total) }}</td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:1.5rem"><a class="btn ghost" href="{{ url_for('orders_list') }}">← All orders</a></p>
+{% endblock %}

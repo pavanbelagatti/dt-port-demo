@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Cart · shopdemo{% endblock %}
+{% block content %}
+  <h1>Your cart</h1>
+  {% if lines %}
+    <table>
+      <thead>
+        <tr><th>Product</th><th>Qty</th><th>Line total</th></tr>
+      </thead>
+      <tbody>
+        {% for l in lines %}
+          <tr>
+            <td>{{ l.product.name }} <span style="color:var(--muted)">({{ l.product.sku }})</span></td>
+            <td>{{ l.qty }}</td>
+            <td>${{ "%.2f"|format(l.line_total) }}</td>
+          </tr>
+        {% endfor %}
+        <tr class="total-row">
+          <td colspan="2">Total</td>
+          <td>${{ "%.2f"|format(total) }}</td>
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:1.25rem; display:flex; gap:.75rem">
+      <form method="post" action="{{ url_for('checkout') }}">
+        <button class="btn" type="submit">Checkout</button>
+      </form>
+      <form method="post" action="{{ url_for('cart_clear') }}">
+        <button class="btn ghost" type="submit">Clear cart</button>
+      </form>
+    </div>
+  {% else %}
+    <div class="empty">Your cart is empty. <a href="{{ url_for('home') }}" style="color:var(--accent)">Browse products →</a></div>
+  {% endif %}
+{% endblock %}

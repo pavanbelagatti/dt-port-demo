@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}shopdemo{% endblock %}</title>
+  <style>
+    :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8e9ee; --muted:#8b909b; --accent:#7c5cff; --danger:#ff5470; --ok:#22c55e; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,sans-serif; background:var(--bg); color:var(--fg); }
+    nav { display:flex; gap:1.25rem; align-items:center; padding:1rem 2rem; background:#13151b; border-bottom:1px solid #20232b; }
+    nav a { color:var(--fg); text-decoration:none; font-weight:500; }
+    nav a:hover { color:var(--accent); }
+    nav .brand { font-weight:700; font-size:1.1rem; color:var(--accent); margin-right:1rem; }
+    nav .spacer { flex:1; }
+    nav .pill { background:#23262f; padding:.25rem .75rem; border-radius:999px; font-size:.85rem; color:var(--muted); }
+    main { max-width:1100px; margin:0 auto; padding:2rem; }
+    h1 { margin-top:0; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:1rem; }
+    .card { background:var(--card); border-radius:.75rem; padding:1rem; border:1px solid #23262f; }
+    .card h3 { margin:0 0 .25rem; font-size:1rem; }
+    .card .cat { color:var(--muted); font-size:.8rem; }
+    .card .price { font-size:1.15rem; font-weight:600; margin:.5rem 0; }
+    .card .stock { color:var(--muted); font-size:.8rem; }
+    .btn { display:inline-block; background:var(--accent); color:white; border:none; padding:.5rem 1rem; border-radius:.5rem; cursor:pointer; font-weight:500; text-decoration:none; font-size:.9rem; }
+    .btn:hover { opacity:.9; }
+    .btn.ghost { background:transparent; border:1px solid #2a2e38; color:var(--fg); }
+    .btn.danger { background:var(--danger); }
+    table { width:100%; border-collapse:collapse; background:var(--card); border-radius:.75rem; overflow:hidden; }
+    th, td { padding:.75rem 1rem; text-align:left; border-bottom:1px solid #23262f; }
+    th { background:#13151b; color:var(--muted); font-weight:500; font-size:.85rem; }
+    .total-row td { font-weight:700; font-size:1.05rem; }
+    .empty { color:var(--muted); padding:2rem; text-align:center; }
+    .ok { color:var(--ok); }
+    .err { color:var(--danger); }
+    form { display:inline; }
+    .status-badge { display:inline-block; padding:.15rem .55rem; border-radius:999px; font-size:.75rem; background:#23262f; color:var(--muted); }
+    .status-badge.confirmed { background:rgba(34,197,94,.15); color:var(--ok); }
+  </style>
+</head>
+<body>
+  <nav>
+    <span class="brand">shopdemo</span>
+    <a href="{{ url_for('home') }}">Products</a>
+    <a href="{{ url_for('cart_view') }}">Cart</a>
+    <a href="{{ url_for('orders_list') }}">Orders</a>
+    <span class="spacer"></span>
+    <span class="pill">traced via OTel → Dynatrace</span>
+  </nav>
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

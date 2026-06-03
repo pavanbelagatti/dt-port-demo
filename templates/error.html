@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}{{ code }} · shopdemo{% endblock %}
+{% block content %}
+  <h1 class="err">{{ code }}</h1>
+  <p style="font-size:1.1rem">{{ description }}</p>
+  <p><a class="btn ghost" href="{{ url_for('home') }}">← Back to shop</a></p>
+{% endblock %}
