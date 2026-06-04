@@ -13,19 +13,21 @@ Core endpoints:
   GET  /orders/<order_id>    -> order detail
   GET  /shipping/rates       -> outbound call to api.github.com
 
-Service endpoints (simulate microservice calls):
-  GET  /payments/process     -> payments-service (~8% failure, variable latency)
-  GET  /auth/verify          -> auth-service (~3% failure, session validation)
-  GET  /shipping/track/<id>  -> shipping-service (~5% failure, downstream delay)
-  GET  /inventory/check      -> inventory-service (fast, rarely fails)
+Service endpoints (each emits APM under its own service name):
+  GET  /payments/process     -> service: payments-service (~8% failure)
+  GET  /auth/verify          -> service: auth-service (~3% failure)
+  GET  /shipping/track/<id>  -> service: shipping-service (~5% failure)
+  GET  /inventory/check      -> service: inventory-service (fast, rarely fails)
 
-Failure scenario endpoints (for realistic incident demos):
+Failure scenario endpoints:
   GET  /scenarios/memory-leak      -> simulates unbounded memory growth
   GET  /scenarios/slow-db          -> simulates slow DB query (2-8s)
-  GET  /scenarios/cascade-failure  -> simulates cascade: payments -> shipping -> orders
+  GET  /scenarios/cascade-failure  -> cascade: payments -> shipping -> orders
   GET  /scenarios/404-spike        -> generates burst of 404s
   GET  /scenarios/auth-failure     -> simulates auth service degradation
-  GET  /scenarios/latency-spike    -> simulates sudden latency spike across endpoints
+  GET  /scenarios/latency-spike    -> sudden latency spike across endpoints
+  GET  /scenarios/reset-all        -> reset all failure modes
+  GET  /scenarios/status           -> check active failure modes
 
 Legacy:
   GET  /healthz  -> liveness
@@ -38,7 +40,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---- Datadog tracing — must come before all other imports --------------------
-from ddtrace import patch_all
+from ddtrace import patch_all, tracer
 patch_all()
 
 # ---- Standard imports --------------------------------------------------------
@@ -64,7 +66,7 @@ log = logging.getLogger("shopdemo")
 
 UPSTREAM_RATES_URL = os.getenv("UPSTREAM_RATES_URL", "https://api.github.com/zen")
 
-# --- Global failure mode flags (toggled by scenario endpoints) ----------------
+# --- Global failure mode flags ------------------------------------------------
 _failure_modes = {
     "memory_leak":     False,
     "slow_db":         False,
@@ -73,8 +75,6 @@ _failure_modes = {
     "latency_spike":   False,
 }
 _failure_lock = Lock()
-
-# Simulated memory leak bucket
 _leak_bucket = []
 
 # --- Seed product catalog -----------------------------------------------------
@@ -118,7 +118,6 @@ def _cart_total(cart: dict) -> float:
     return round(sum(l["line_total"] for l in _cart_lines(cart)), 2)
 
 def _extra_latency(base_min=0.0, base_max=0.1) -> float:
-    """Add extra latency if latency spike mode is active."""
     base = random.uniform(base_min, base_max)
     if _failure_modes["latency_spike"]:
         base += random.uniform(1.5, 4.0)
@@ -178,7 +177,7 @@ def cart_clear():
 
 @app.route("/checkout", methods=["POST"])
 def checkout():
-    """~5% intentional payment failures."""
+    """~5% intentional payment failures, spikes during cascade."""
     cart = _get_cart()
     if not cart:
         abort(400, description="cart is empty")
@@ -187,7 +186,6 @@ def checkout():
 
     time.sleep(_extra_latency(0.2, 0.6))
 
-    # Cascade failure makes checkout fail much more
     failure_rate = 0.60 if _failure_modes["cascade_failure"] else 0.05
     if random.random() < failure_rate:
         log.error("checkout: payment failure (cascade=%s, total=%.2f)",
@@ -234,66 +232,118 @@ def shipping_rates():
         log.warning("shipping_rates: upstream failed: %s", exc)
         abort(503, description="rates provider unavailable")
 
-# --- Service endpoints (simulate microservice calls) --------------------------
+# --- Service endpoints — each emits APM under its own service name ------------
 
 @app.route("/payments/process")
 def payments_process():
-    """payments-service — 8% failure rate, variable latency."""
-    latency = _extra_latency(0.1, 0.4)
-    if _failure_modes["cascade_failure"]:
-        latency += random.uniform(2.0, 5.0)
-    time.sleep(latency)
+    """
+    Emits traces as service: payments-service.
+    8% failure rate, higher during cascade failure.
+    Owner: Payments team · Tier-1
+    """
+    with tracer.trace("payments.process",
+                      service="payments-service",
+                      resource="GET /payments/process") as span:
 
-    failure_rate = 0.70 if _failure_modes["cascade_failure"] else 0.08
-    if random.random() < failure_rate:
-        log.error("payments: processing failure (cascade=%s)", _failure_modes["cascade_failure"])
-        abort(503, description="payments service unavailable")
+        latency = _extra_latency(0.1, 0.4)
+        if _failure_modes["cascade_failure"]:
+            latency += random.uniform(2.0, 5.0)
+        time.sleep(latency)
 
-    amount = round(random.uniform(10, 500), 2)
-    log.info("payments: processed amount=%.2f latency=%.3fs", amount, latency)
-    return jsonify(status="approved", amount=amount, latency_ms=round(latency * 1000))
+        failure_rate = 0.70 if _failure_modes["cascade_failure"] else 0.08
+        if random.random() < failure_rate:
+            span.set_tag("error", True)
+            span.set_tag("error.msg", "payments service unavailable")
+            log.error("payments: processing failure (cascade=%s)", _failure_modes["cascade_failure"])
+            abort(503, description="payments service unavailable")
+
+        amount = round(random.uniform(10, 500), 2)
+        span.set_tag("payment.amount", amount)
+        span.set_tag("payment.status", "approved")
+        log.info("payments: processed amount=%.2f latency=%.3fs", amount, latency)
+        return jsonify(status="approved", amount=amount, latency_ms=round(latency * 1000))
+
 
 @app.route("/auth/verify")
 def auth_verify():
-    """auth-service — 3% failure, spikes when auth_degraded is active."""
-    latency = _extra_latency(0.05, 0.15)
-    if _failure_modes["auth_degraded"]:
-        latency += random.uniform(1.0, 3.0)
-    time.sleep(latency)
+    """
+    Emits traces as service: auth-service.
+    3% failure rate, spikes to 45% when auth_degraded is active.
+    Owner: Security team · Tier-1
+    """
+    with tracer.trace("auth.verify",
+                      service="auth-service",
+                      resource="GET /auth/verify") as span:
 
-    failure_rate = 0.45 if _failure_modes["auth_degraded"] else 0.03
-    if random.random() < failure_rate:
-        log.error("auth: verification failure (degraded=%s)", _failure_modes["auth_degraded"])
-        abort(401, description="auth service degraded — token validation failed")
+        latency = _extra_latency(0.05, 0.15)
+        if _failure_modes["auth_degraded"]:
+            latency += random.uniform(1.0, 3.0)
+        time.sleep(latency)
 
-    user_id = "usr-" + uuid.uuid4().hex[:8]
-    log.info("auth: verified user=%s latency=%.3fs", user_id, latency)
-    return jsonify(status="verified", user_id=user_id, latency_ms=round(latency * 1000))
+        failure_rate = 0.45 if _failure_modes["auth_degraded"] else 0.03
+        if random.random() < failure_rate:
+            span.set_tag("error", True)
+            span.set_tag("error.msg", "token validation failed")
+            log.error("auth: verification failure (degraded=%s)", _failure_modes["auth_degraded"])
+            abort(401, description="auth service degraded — token validation failed")
+
+        user_id = "usr-" + uuid.uuid4().hex[:8]
+        span.set_tag("auth.user_id", user_id)
+        span.set_tag("auth.status", "verified")
+        log.info("auth: verified user=%s latency=%.3fs", user_id, latency)
+        return jsonify(status="verified", user_id=user_id, latency_ms=round(latency * 1000))
+
 
 @app.route("/shipping/track/<tracking_id>")
 def shipping_track(tracking_id):
-    """shipping-service — 5% failure, downstream delay."""
-    latency = _extra_latency(0.1, 0.3)
-    if _failure_modes["cascade_failure"]:
-        latency += random.uniform(1.5, 4.0)
-    time.sleep(latency)
+    """
+    Emits traces as service: shipping-service.
+    5% failure rate, spikes during cascade failure.
+    Owner: Logistics team · Tier-2
+    """
+    with tracer.trace("shipping.track",
+                      service="shipping-service",
+                      resource="GET /shipping/track") as span:
 
-    failure_rate = 0.55 if _failure_modes["cascade_failure"] else 0.05
-    if random.random() < failure_rate:
-        log.error("shipping: tracking failure for %s", tracking_id)
-        abort(503, description="shipping provider timeout")
+        latency = _extra_latency(0.1, 0.3)
+        if _failure_modes["cascade_failure"]:
+            latency += random.uniform(1.5, 4.0)
+        time.sleep(latency)
 
-    statuses = ["in_transit", "out_for_delivery", "delivered", "processing"]
-    log.info("shipping: tracked id=%s latency=%.3fs", tracking_id, latency)
-    return jsonify(tracking_id=tracking_id, status=random.choice(statuses), latency_ms=round(latency * 1000))
+        failure_rate = 0.55 if _failure_modes["cascade_failure"] else 0.05
+        if random.random() < failure_rate:
+            span.set_tag("error", True)
+            span.set_tag("error.msg", "shipping provider timeout")
+            log.error("shipping: tracking failure for %s", tracking_id)
+            abort(503, description="shipping provider timeout")
+
+        statuses = ["in_transit", "out_for_delivery", "delivered", "processing"]
+        status = random.choice(statuses)
+        span.set_tag("shipping.tracking_id", tracking_id)
+        span.set_tag("shipping.status", status)
+        log.info("shipping: tracked id=%s status=%s latency=%.3fs", tracking_id, status, latency)
+        return jsonify(tracking_id=tracking_id, status=status, latency_ms=round(latency * 1000))
+
 
 @app.route("/inventory/check")
 def inventory_check():
-    """inventory-service — fast, rarely fails."""
-    time.sleep(_extra_latency(0.01, 0.05))
-    sku = random.choice(list(PRODUCTS.keys()))
-    product = PRODUCTS[sku]
-    return jsonify(sku=sku, name=product["name"], stock=product["stock"], available=product["stock"] > 0)
+    """
+    Emits traces as service: inventory-service.
+    Fast, rarely fails.
+    Owner: Platform team · Tier-2
+    """
+    with tracer.trace("inventory.check",
+                      service="inventory-service",
+                      resource="GET /inventory/check") as span:
+
+        time.sleep(_extra_latency(0.01, 0.05))
+        sku = random.choice(list(PRODUCTS.keys()))
+        product = PRODUCTS[sku]
+        span.set_tag("inventory.sku", sku)
+        span.set_tag("inventory.stock", product["stock"])
+        return jsonify(sku=sku, name=product["name"],
+                       stock=product["stock"], available=product["stock"] > 0)
+
 
 # --- Failure scenario endpoints -----------------------------------------------
 
@@ -301,26 +351,20 @@ def inventory_check():
 def scenario_memory_leak():
     """
     Scenario: Memory leak — unbounded object accumulation.
-    Simulates a service that allocates memory but never frees it.
-    In production: look for growing heap, GC pressure, eventual OOM.
-    Owner: Platform team · Tier-1 · Runbook: check for unbounded caches
+    Owner: Platform · Tier-1
     """
     global _leak_bucket
     with _failure_lock:
         _failure_modes["memory_leak"] = True
 
-    # Allocate ~1MB of data per call, never free it
     chunk = ["x" * 1024 for _ in range(1024)]
     _leak_bucket.extend(chunk)
-
     leak_size_mb = round(len(_leak_bucket) / (1024 * 1024), 2)
-    log.warning("memory_leak: bucket size ~%.2fMB (%d objects)", leak_size_mb, len(_leak_bucket))
+    log.warning("memory_leak: bucket ~%.2fMB (%d objects)", leak_size_mb, len(_leak_bucket))
 
     return jsonify(
-        scenario="memory-leak",
-        status="active",
-        leak_size_mb=leak_size_mb,
-        objects_allocated=len(_leak_bucket),
+        scenario="memory-leak", status="active",
+        leak_size_mb=leak_size_mb, objects_allocated=len(_leak_bucket),
         symptom="heap growing unboundedly — GC pressure will increase",
         owner="Platform",
         runbook="Check for unbounded caches, session objects, or event listeners not being cleared"
@@ -333,28 +377,23 @@ def scenario_memory_leak_reset():
     gc.collect()
     with _failure_lock:
         _failure_modes["memory_leak"] = False
-    log.info("memory_leak: reset — bucket cleared")
-    return jsonify(scenario="memory-leak", status="reset", objects_freed=True)
+    return jsonify(scenario="memory-leak", status="reset")
 
 @app.route("/scenarios/slow-db")
 def scenario_slow_db():
     """
     Scenario: Slow DB query — missing index causes full table scan.
-    Simulates a DB query that takes 2-8 seconds.
-    In production: look for p99 latency spike, connection pool exhaustion.
-    Owner: Payments team · Tier-1 · Runbook: check slow query log, add index
+    Owner: Payments · Tier-1
     """
     with _failure_lock:
         _failure_modes["slow_db"] = True
 
-    # Simulate the slow query
     query_time = random.uniform(2.0, 8.0)
     time.sleep(query_time)
+    log.warning("slow_db: query took %.2fs (simulated missing index)", query_time)
 
-    log.warning("slow_db: query took %.2fs (simulated missing index on orders table)", query_time)
     return jsonify(
-        scenario="slow-db",
-        status="active",
+        scenario="slow-db", status="active",
         query_time_seconds=round(query_time, 2),
         symptom=f"SELECT on orders table took {round(query_time, 2)}s — likely missing index",
         owner="Payments",
@@ -366,28 +405,24 @@ def scenario_slow_db():
 def scenario_slow_db_reset():
     with _failure_lock:
         _failure_modes["slow_db"] = False
-    log.info("slow_db: reset")
     return jsonify(scenario="slow-db", status="reset")
 
 @app.route("/scenarios/cascade-failure")
 def scenario_cascade_failure():
     """
-    Scenario: Cascade failure — payments down → checkout fails → orders spike.
-    Simulates a downstream dependency failure that cascades up the call chain.
-    In production: look for correlated error spikes across multiple services.
-    Owner: Platform team · Tier-1 · Runbook: circuit breaker, fallback to queue
+    Scenario: Cascade failure — payments → checkout → shipping.
+    Owner: Platform · Tier-1
     """
     with _failure_lock:
         _failure_modes["cascade_failure"] = True
 
-    log.error("cascade_failure: ACTIVATED — payments degraded, cascade spreading to checkout and shipping")
+    log.error("cascade_failure: ACTIVATED — payments degraded, cascading to checkout and shipping")
     return jsonify(
-        scenario="cascade-failure",
-        status="ACTIVE",
-        symptom="payments-service degraded → checkout error rate spiking → shipping timeouts",
-        cascade_path=["payments-service → 503", "checkout → 502 (60%)", "shipping/track → 503 (55%)"],
+        scenario="cascade-failure", status="ACTIVE",
+        symptom="payments-service degraded → checkout 60% failure → shipping timeouts",
+        cascade_path=["payments-service → 503 (70%)", "checkout → 502 (60%)", "shipping/track → 503 (55%)"],
         owner="Platform",
-        runbook="1. Check payments-service health · 2. Enable circuit breaker · 3. Route to fallback queue",
+        runbook="1. Check payments-service · 2. Enable circuit breaker · 3. Route to fallback queue",
         affected_services=["dt-port-demo", "payments-service", "shipping-service"]
     )
 
@@ -395,18 +430,14 @@ def scenario_cascade_failure():
 def scenario_cascade_failure_reset():
     with _failure_lock:
         _failure_modes["cascade_failure"] = False
-    log.info("cascade_failure: reset — all services recovering")
     return jsonify(scenario="cascade-failure", status="reset")
 
 @app.route("/scenarios/404-spike")
 def scenario_404_spike():
     """
-    Scenario: 404 spike — bad deploy introduced broken product URLs.
-    Simulates a surge of 404s from a bad deploy that broke URL routing.
-    In production: look for 404 rate spike, usually indicates bad deploy or CDN misconfiguration.
-    Owner: Platform team · Tier-2 · Runbook: check recent deploy, CDN config
+    Scenario: 404 spike — bad deploy broke product URL routing.
+    Owner: Platform · Tier-2
     """
-    # Generate a burst of 404-inducing paths
     bad_skus = [f"SKU-{random.randint(900, 999):03d}" for _ in range(5)]
     errors = []
     for sku in bad_skus:
@@ -414,8 +445,7 @@ def scenario_404_spike():
         errors.append({"sku": sku, "status": 404, "error": f"unknown sku {sku}"})
 
     return jsonify(
-        scenario="404-spike",
-        status="active",
+        scenario="404-spike", status="active",
         errors_generated=len(errors),
         symptom="surge of 404s on /products/<sku> — likely bad deploy broke URL routing",
         owner="Platform",
@@ -426,21 +456,18 @@ def scenario_404_spike():
 @app.route("/scenarios/auth-failure")
 def scenario_auth_failure():
     """
-    Scenario: Auth service degradation — token validation latency spike.
-    Simulates the auth service becoming slow and unreliable.
-    In production: affects all authenticated endpoints, creates user-facing errors.
-    Owner: Auth team · Tier-1 · Runbook: check JWT service, token cache
+    Scenario: Auth service degradation.
+    Owner: Security · Tier-1
     """
     with _failure_lock:
         _failure_modes["auth_degraded"] = True
 
     log.error("auth_failure: ACTIVATED — token validation degraded, 45%% failure rate")
     return jsonify(
-        scenario="auth-failure",
-        status="ACTIVE",
+        scenario="auth-failure", status="ACTIVE",
         symptom="auth-service token validation failing at 45% rate with 1-3s latency",
-        owner="Auth",
-        runbook="1. Check JWT signing service · 2. Verify token cache hit rate · 3. Restart auth pods if needed",
+        owner="Security",
+        runbook="1. Check JWT signing service · 2. Verify token cache hit rate · 3. Restart auth pods",
         affected_endpoints=["/auth/verify", "/checkout", "/orders"]
     )
 
@@ -448,27 +475,23 @@ def scenario_auth_failure():
 def scenario_auth_failure_reset():
     with _failure_lock:
         _failure_modes["auth_degraded"] = False
-    log.info("auth_failure: reset")
     return jsonify(scenario="auth-failure", status="reset")
 
 @app.route("/scenarios/latency-spike")
 def scenario_latency_spike():
     """
-    Scenario: Latency spike — all endpoints suddenly slow.
-    Simulates a noisy neighbour or resource contention causing global latency.
-    In production: p99 spikes across all endpoints simultaneously.
-    Owner: Platform team · Tier-1 · Runbook: check CPU/memory, noisy neighbour
+    Scenario: Global latency spike — resource contention.
+    Owner: Platform · Tier-1
     """
     with _failure_lock:
         _failure_modes["latency_spike"] = True
 
     log.error("latency_spike: ACTIVATED — adding 1.5-4s to all endpoint response times")
     return jsonify(
-        scenario="latency-spike",
-        status="ACTIVE",
+        scenario="latency-spike", status="ACTIVE",
         symptom="p99 latency spiking 1.5-4s across ALL endpoints — likely resource contention",
         owner="Platform",
-        runbook="1. Check CPU/memory usage · 2. Look for noisy neighbour on host · 3. Check DB connection pool",
+        runbook="1. Check CPU/memory · 2. Look for noisy neighbour · 3. Check DB connection pool",
         affected_endpoints="ALL"
     )
 
@@ -476,12 +499,10 @@ def scenario_latency_spike():
 def scenario_latency_spike_reset():
     with _failure_lock:
         _failure_modes["latency_spike"] = False
-    log.info("latency_spike: reset")
     return jsonify(scenario="latency-spike", status="reset")
 
 @app.route("/scenarios/reset-all")
 def scenario_reset_all():
-    """Reset all failure modes at once."""
     global _leak_bucket
     with _failure_lock:
         for k in _failure_modes:
@@ -493,7 +514,6 @@ def scenario_reset_all():
 
 @app.route("/scenarios/status")
 def scenario_status():
-    """Check which failure modes are currently active."""
     return jsonify(
         failure_modes=_failure_modes,
         leak_bucket_size=len(_leak_bucket),
@@ -505,10 +525,7 @@ def scenario_status():
 @app.route("/healthz")
 def healthz():
     active = [k for k, v in _failure_modes.items() if v]
-    return jsonify(
-        status="degraded" if active else "ok",
-        active_failure_modes=active
-    ), 200
+    return jsonify(status="degraded" if active else "ok", active_failure_modes=active), 200
 
 @app.route("/slow")
 def slow():
